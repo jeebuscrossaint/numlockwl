@@ -1,5 +1,6 @@
 ```
-									NUMLOCKWL
+        				NUMLOCKWL
+
 This little thingy allows you to start a wayland session of your favorite window manager, sway, river, etc with numlock enabled.
 It is basically a clone of NumLockX for wayland.
 
