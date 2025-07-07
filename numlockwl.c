@@ -88,8 +88,14 @@ void toggle_numlock(int fd) {
 // Print help information
 void print_help(const char *program_name) {
   printf("numlockwl - NumLock toggler for Wayland\n");
-  printf("Usage: %s [--on|--off|-h|--help]\n", program_name);
+  printf("Usage: %s [--on|--off|--device=PATH|--all|-h|--help]\n", program_name);
   printf("Source: https://github.com/jeebuscrossaint/numlockwl\n\n");
+  printf("Options:\n");
+  printf("  --on              Force NumLock on\n");
+  printf("  --off             Force NumLock off\n");
+  printf("  --device=PATH     Use specific device (e.g., --device=/dev/input/event3)\n");
+  printf("  --all             Process all suitable keyboards\n");
+  printf("  -h, --help        Show this help message\n\n");
   printf("MIT License\n\n");
   printf("Copyright (c) 2025 Amarnath P.\n\n");
   printf("Permission is hereby granted, free of charge, to any person obtaining a copy\n");
@@ -116,25 +122,109 @@ int check_device_has_numlock(struct libevdev *dev) {
       libevdev_has_event_code(dev, EV_KEY, KEY_NUMLOCK) &&
       libevdev_has_event_type(dev, EV_LED) &&
       libevdev_has_event_code(dev, EV_LED, LED_NUML)) {
-
-    // Only consider keyboard devices
-    if (libevdev_has_event_code(dev, EV_KEY, KEY_Q) && // Basic keyboard check
-        libevdev_has_event_code(dev, EV_KEY, KEY_SPACE)) {
-      return 1;
-    }
+    return 1;
   }
   return 0;
 }
 
-// Find and use a single keyboard with NumLock capability
+// More robust keyboard detection - check for multiple keyboard-specific keys
+int is_likely_keyboard(struct libevdev *dev) {
+  const char *name = libevdev_get_name(dev);
+  
+  // Skip devices that are obviously not keyboards
+  if (name && (
+      strstr(name, "Mouse") || strstr(name, "mouse") ||
+      strstr(name, "Trackpad") || strstr(name, "trackpad") ||
+      strstr(name, "Touchpad") || strstr(name, "touchpad") ||
+      strstr(name, "Tablet") || strstr(name, "tablet") ||
+      strstr(name, "Stylus") || strstr(name, "stylus") ||
+      strstr(name, "Trackball") || strstr(name, "trackball"))) {
+    return 0;
+  }
+  
+  // Check for a good set of keyboard keys that are unlikely to be on mice
+  int keyboard_keys = 0;
+  int required_keys[] = {
+    KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y,  // QWERTY row
+    KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H,  // ASDF row  
+    KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N,  // ZXCV row
+    KEY_SPACE, KEY_ENTER, KEY_BACKSPACE, KEY_TAB,
+    KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL
+  };
+  
+  for (int i = 0; i < sizeof(required_keys)/sizeof(required_keys[0]); i++) {
+    if (libevdev_has_event_code(dev, EV_KEY, required_keys[i])) {
+      keyboard_keys++;
+    }
+  }
+  
+  // Require at least 20 keyboard keys to be considered a keyboard
+  return keyboard_keys >= 20;
+}
+
+// Process a single device
+int process_device(const char *device_path, int force_on, int force_off, int *processed_count) {
+  struct libevdev *dev = NULL;
+  int success = 0;
+  
+  int fd = open(device_path, O_RDWR);
+  if (fd == -1) {
+    return 0; // Can't open device, skip it
+  }
+
+  // Initialize libevdev device
+  if (libevdev_new_from_fd(fd, &dev) < 0) {
+    close(fd);
+    return 0;
+  }
+
+  // Check if the device has NumLock capability and is likely a keyboard
+  if (check_device_has_numlock(dev) && is_likely_keyboard(dev)) {
+    printf("Found keyboard with NumLock: %s (%s)\n", device_path,
+           libevdev_get_name(dev));
+
+    // Check current NumLock state
+    int numlock_state = is_numlock_on(fd);
+
+    if (numlock_state < 0) {
+      printf("Could not determine NumLock state for %s.\n", device_path);
+    } else if (numlock_state) {
+      printf("NumLock is currently ON for %s.\n", device_path);
+
+      // Toggle off if forced or in toggle mode
+      if (force_off || (!force_on)) {
+        toggle_numlock(fd);
+        (*processed_count)++;
+        success = 1;
+      }
+    } else {
+      printf("NumLock is currently OFF for %s.\n", device_path);
+
+      // Toggle on if forced or in toggle mode
+      if (force_on || (!force_off)) {
+        toggle_numlock(fd);
+        (*processed_count)++;
+        success = 1;
+      }
+    }
+  }
+
+  libevdev_free(dev);
+  close(fd);
+  return success;
+}
+
+// Find and use keyboard(s) with NumLock capability
 int main(int argc, char *argv[]) {
   struct libevdev *dev = NULL;
   char device_path[256];
   DIR *dir;
   struct dirent *entry;
-  int toggled = 0;
+  int processed_count = 0;
   int force_on = 0;
   int force_off = 0;
+  int process_all = 0;
+  char *specific_device = NULL;
 
   // Parse command line arguments
   for (int i = 1; i < argc; i++) {
@@ -142,12 +232,28 @@ int main(int argc, char *argv[]) {
       force_on = 1;
     } else if (strcmp(argv[i], "--off") == 0) {
       force_off = 1;
+    } else if (strcmp(argv[i], "--all") == 0) {
+      process_all = 1;
+    } else if (strncmp(argv[i], "--device=", 9) == 0) {
+      specific_device = argv[i] + 9;
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       print_help(argv[0]);
       return 0;
     } else {
       printf("Unknown option: %s\n", argv[i]);
       printf("Use -h or --help for usage information.\n");
+      return 1;
+    }
+  }
+
+  // If specific device is requested, process only that device
+  if (specific_device) {
+    printf("Processing specific device: %s\n", specific_device);
+    if (process_device(specific_device, force_on, force_off, &processed_count)) {
+      printf("Successfully processed device: %s\n", specific_device);
+      return 0;
+    } else {
+      printf("Failed to process device or device is not a suitable keyboard: %s\n", specific_device);
       return 1;
     }
   }
@@ -164,61 +270,23 @@ int main(int argc, char *argv[]) {
     if (strncmp(entry->d_name, "event", 5) == 0) {
       snprintf(device_path, sizeof(device_path), "/dev/input/%s",
                entry->d_name);
-      int fd = open(device_path, O_RDWR);
-      if (fd == -1) {
-        continue; // Can't open device, skip it
-      }
-
-      // Initialize libevdev device
-      if (libevdev_new_from_fd(fd, &dev) < 0) {
-        close(fd);
-        continue;
-      }
-
-      // Check if the device has NumLock capability
-      if (check_device_has_numlock(dev)) {
-        printf("Found keyboard with NumLock: %s (%s)\n", device_path,
-               libevdev_get_name(dev));
-
-        // Check current NumLock state
-        int numlock_state = is_numlock_on(fd);
-
-        if (numlock_state < 0) {
-          printf("Could not determine NumLock state.\n");
-        } else if (numlock_state) {
-          printf("NumLock is currently ON.\n");
-
-          // Toggle off if forced or in toggle mode
-          if (force_off || (!force_on && !toggled)) {
-            toggle_numlock(fd);
-            toggled = 1;
-          }
-        } else {
-          printf("NumLock is currently OFF.\n");
-
-          // Toggle on if forced or in toggle mode
-          if (force_on || (!force_off && !toggled)) {
-            toggle_numlock(fd);
-            toggled = 1;
-          }
+      
+      if (process_device(device_path, force_on, force_off, &processed_count)) {
+        // If not processing all devices, stop after first successful one
+        if (!process_all) {
+          break;
         }
-
-        // We found and processed a keyboard, stop here
-        libevdev_free(dev);
-        close(fd);
-        break;
       }
-
-      libevdev_free(dev);
-      close(fd);
     }
   }
 
   closedir(dir);
 
-  if (!toggled) {
-    printf("No suitable keyboard found or NumLock already in desired state.\n");
+  if (processed_count == 0) {
+    printf("No suitable keyboards found or NumLock already in desired state.\n");
     return 1;
+  } else {
+    printf("Successfully processed %d keyboard(s).\n", processed_count);
   }
 
   return 0;
